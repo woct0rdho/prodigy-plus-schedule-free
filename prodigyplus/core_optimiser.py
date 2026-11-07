@@ -1,8 +1,13 @@
 import torch
 from statistics import harmonic_mean
 
+from . import megakernel
+
 class CoreOptimiser(torch.optim.Optimizer):
     VERSION = (2, 0, 0)
+    # run the step as three Triton kernels over address tables (see megakernel.py) for the option set the training config
+    # uses; anything else keeps the per-parameter loop, and `use_megakernel=False` turns it off for the whole optimizer
+    use_megakernel_default = True
 
     def __init__(self, params, **kwargs):
         if not 0.0 < kwargs['d0']:
@@ -51,6 +56,7 @@ class CoreOptimiser(torch.optim.Optimizer):
                 # We skip the Adam-atan2 branch entirely when FOCUS is enabled.
 
         defaults = dict(kwargs)
+        defaults.setdefault('use_megakernel', self.use_megakernel_default)
 
         defaults['optimiser_version'] = CoreOptimiser.VERSION
         defaults['effective_lr'] = defaults['lr']
@@ -577,6 +583,13 @@ class CoreOptimiser(torch.optim.Optimizer):
     def step_parameter(self, p, group, i):
         self.step_param(p, group)
 
+    def load_state_dict(self, state_dict):
+        """Also drops the megakernel's address tables: the loaded state may be new tensors."""
+        result = super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            group.pop("megakernel_state", None)
+        return result
+
     @torch.no_grad()
     def step(self, closure=None):
         self.try_unhook_kohya_fbp()
@@ -596,6 +609,13 @@ class CoreOptimiser(torch.optim.Optimizer):
         for param_group in self.param_groups:
             if param_group['fused_back_pass']:
                 break
+
+            if megakernel.step_megakernel(self, param_group):
+                # one call covers the whole group; keep the per-step bookkeeping the loop below would do
+                self.on_start_step()
+                for _ in range(len(param_group['params'])):
+                    self.on_end_step()
+                continue
 
             for p in param_group["params"]:
                 self.step_param(p, param_group)

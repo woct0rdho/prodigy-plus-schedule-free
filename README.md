@@ -90,6 +90,47 @@ In some scenarios, it can be advantageous to freeze Prodigy's adaptive stepsize 
 
 This setting can be particularly helpful when training diffusion models, which have very different gradient behaviour than what most optimisers are tuned for. Prodigy in particular will increase the LR forever if it is not stopped or capped in some way (usually via a decaying LR scheduler). Even if you don't need to cap LR growth, the optimiser will free all Prodigy-specific state memory once `prodigy_steps` is exceeded, which may improve performance where memory usage is on the borderline.
 
+## Triton step
+
+**`use_megakernel=True` (default).** The per-parameter loop launches about 47 kernels per parameter tensor - the fp32
+upcasts of the parameter, of `z` and of the gradient, the second moment, `atan2`, the schedule-free lerp, the weight decay
+and two copy-backs - so a LoRA with a few hundred tensors spends most of its step in launch overhead and in re-reading
+the same data. `prodigyplus/megakernel.py` replaces the loop with three Triton kernels that address the parameters where
+they are, through tables of `int64` addresses built once per group. The state is the loop's own (`z`, `p0`, `s`,
+`exp_avg_sq_row`/`col`), so `state_dict()` is unchanged and a checkpoint resumes on either path.
+
+Per step: one program per parameter computes the factored second moment of the gradient and the Prodigy statistics on
+the `1-in-11` subsample, a second applies the row-partial sums and the group accumulators, and a third does the
+Adam-atan2 update, the schedule-free lerp, the decoupled weight decay and the bf16 stochastic rounding.
+
+A rank-64 Anima LoRA (508 tensors, 81.3 M parameters, RTX 3080 Ti Laptop, `eps=None` as in the training config,
+stochastic rounding on):
+
+| step | ms | state | step scratch | launches |
+|---|---|---|---|---|
+| per-parameter loop | 366 | 2.43 B/param | 0.18 B/param | 21 595 |
+| Triton step | **8** | 2.55 B/param | 0.01 B/param | **23** |
+
+The state is what the algorithm needs - `z` (2 B/param), the `1-in-11` `p0`/`s` subsamples (0.36) and the fp32 factored
+second moment (0.06) - plus 0.12 B/param of row-block partials for the step. Neither the arity nor the shapes are baked
+into the compiled code (a table entry is one `tl.load`, the tile sizes are constants, the per-parameter sizes are
+operands), so a LoRA with 500 or 5000 tensors, or with 64 or 8192 wide matrices, compiles the same three kernels once:
+about 1 s on the first step, then nothing.
+
+Notes:
+* Option coverage is deliberately narrow: the schedule-free step with `eps=None` (Adam-atan2), `factored=True`,
+  `factored_fp32=True`, `weight_decay_by_lr` and no bias correction, on 2-D bf16 parameters. Anything else - and
+  `fused_back_pass`, `use_focus`, `use_cautious`, `use_grams`, `use_adopt`, `use_orthograd`, `use_speed`, a 1-D parameter
+  or a step where some parameter has no gradient - keeps the per-parameter loop. `use_megakernel=False` forces the loop.
+* The dither is Triton's Philox: the seed carries the step, the offset separates the parameters and the elements, and two
+  of the four streams of one call cover the parameter and `z`. It is not PyTorch's stream and does not need to be -
+  stochastic rounding only needs an unbiased dither, which the low 16 mantissa bits give (it rounds up with probability
+  equal to the fractional part, exactly like `copy_stochastic_`).
+* Loading a checkpoint casts state tensors to the parameter's dtype, which turns the fp32 factored second moment into
+  bf16; the kernel path restores fp32 (as `factored_fp32=True` asks) the first time it sees a loaded state.
+* `state_dict()` shares storage with the live state, as in any PyTorch optimiser, so a checkpoint has to be serialized
+  before a second optimizer can use it.
+
 ## Experimental features
 **Adam-atan2:** `eps=None`. Outlined in [Scaling Exponents Across Parameterizations and Optimizers](https://arxiv.org/abs/2407.05872), you can use atan2 in place of the regular division plus epsilon found in most Adam-style optimisers. This makes updates scale-invariant, and removes the need to tweak the epsilon. Disabled by default.
 
