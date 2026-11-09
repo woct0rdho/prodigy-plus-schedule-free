@@ -34,13 +34,13 @@ CASES = {
 SUPPORTED = ("default", "no_decay", "large_steps")
 
 
-def make_params(seed=0, scale=0.5):
+def make_params(seed=0, scale=0.5, dtype=torch.bfloat16):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     params = []
     for shape, count in SHAPES:
         for _ in range(count):
             t = torch.randn(shape, generator=gen, device="cuda", dtype=torch.float32) * scale
-            params.append(torch.nn.Parameter(t.bfloat16()))
+            params.append(torch.nn.Parameter(t.to(dtype)))
     return params
 
 
@@ -48,7 +48,7 @@ def set_grads(params, seed, scale=0.1):
     """Large gradients and parameters, so a structural error moves the result far more than rounding does."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     for p in params:
-        p.grad = (torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * scale).bfloat16()
+        p.grad = (torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * scale).to(p.dtype)
 
 
 def build(params, fast=True, **overrides):
@@ -59,8 +59,8 @@ def build(params, fast=True, **overrides):
     return prodigyplus.ProdigyPlusScheduleFree(params, **kwargs)
 
 
-def train(steps=8, seed=7, fast=True, **overrides):
-    params = make_params()
+def train(steps=8, seed=7, fast=True, dtype=torch.bfloat16, **overrides):
+    params = make_params(dtype=dtype)
     kwargs = {"stochastic_rounding": False}  # the exact comparison needs the same rounding as the reference
     kwargs.update(overrides)
     opt = build(params, fast, **kwargs)
@@ -86,20 +86,34 @@ def state(opt):
     return opt.param_groups[0].get("megakernel_state")
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
 @pytest.mark.parametrize("case", SUPPORTED, ids=list(SUPPORTED))
-def test_megakernel_matches_the_per_parameter_loop(case):
-    kernel_params, kernel_opt = train(**CASES[case])
-    ref_params, ref_opt = train(fast=False, **CASES[case])
+def test_megakernel_matches_the_per_parameter_loop(case, dtype):
+    """Both parameter dtypes the loop takes: bf16 (`--full_bf16`) and fp32 (the default with bf16 mixed precision)."""
+    kernel_params, kernel_opt = train(dtype=dtype, **CASES[case])
+    ref_params, ref_opt = train(fast=False, dtype=dtype, **CASES[case])
     assert state(kernel_opt) is not None  # the kernel path ran
 
     for i, (a, b) in enumerate(zip(kernel_params, ref_params)):
-        assert relative_mean_difference(a, b) < 5e-3, (case, i, relative_mean_difference(a, b))
+        assert relative_mean_difference(a, b) < 5e-3, (case, dtype, i, relative_mean_difference(a, b))
 
     kernel_stats, ref_stats = stats(kernel_opt), stats(ref_opt)
     assert kernel_stats["k"] == ref_stats["k"]
     assert kernel_stats["d"] == pytest.approx(ref_stats["d"], rel=1e-6)
     assert kernel_stats["d_numerator"] == pytest.approx(ref_stats["d_numerator"], rel=5e-2, abs=1e-13)
     assert kernel_stats["d_denom"] == pytest.approx(ref_stats["d_denom"], rel=5e-2, abs=1e-13)
+
+
+def test_the_state_dtypes_are_the_reference_ones():
+    """`z` follows the parameter, the subsamples and the second moment are bf16/fp32 respectively, in either case."""
+    for dtype, z_dtype in ((torch.bfloat16, torch.bfloat16), (torch.float32, torch.float32)):
+        params, opt = train(steps=2, dtype=dtype)
+        assert state(opt) is not None
+        per_param = opt.state[params[0]]
+        assert per_param["z"].dtype == z_dtype
+        assert per_param["p0"].dtype == torch.bfloat16
+        assert per_param["s"].dtype == torch.bfloat16
+        assert per_param["exp_avg_sq_row"].dtype == torch.float32
 
 
 @pytest.mark.parametrize("case", CASES, ids=list(CASES))
@@ -124,6 +138,14 @@ def test_one_dimensional_parameters_fall_back():
     opt = build(params)
     opt.step()
     assert state(opt) is None
+
+
+def test_float16_parameters_fall_back():
+    params = [torch.nn.Parameter(torch.randn(64, 2048, device="cuda").half())]
+    params[0].grad = torch.randn(64, 2048, device="cuda").half() * 0.01
+    opt = build(params)
+    opt.step()
+    assert state(opt) is None  # fp16 is not one of the two dtypes the loop takes
 
 
 def test_a_missing_gradient_falls_back():

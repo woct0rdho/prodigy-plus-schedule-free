@@ -34,10 +34,14 @@ update kernel's scalar prelude needs to know the orientation.
 The numerics follow the reference step: fp32 second moment, the `s` EMA rounded to bf16 after each of its two halves, the
 d-statistics summed per parameter first and then across the group in fp32, and the rounding dithering the low 16 mantissa
 bits of the fp32 value before truncating to bf16. The dither comes from Triton's Philox (`tl.randint4x`): the seed is the
-key, a monotonic per-element offset is the counter, and two of the four streams of one call cover `y` and `z` without
-sharing a number. That is not PyTorch's stream and does not need to be - stochastic rounding only needs an unbiased
-dither, which the low-16-bit draw gives: it rounds up with probability equal to the fractional part, exactly like the
-eager `copy_stochastic_`.
+key, a monotonic per-step counter plus a per-parameter base is the offset, and two of the four streams of one call cover
+the parameter and `z` without sharing a number. That is not PyTorch's stream and does not need to be - stochastic
+rounding only needs an unbiased dither, which the low-16-bit draw gives: it rounds up with probability equal to the
+fractional part, exactly like the eager `copy_stochastic_`.
+
+The parameters may be bf16 or fp32 (`mixed_precision='bf16'` without `--full_bf16` keeps a LoRA in fp32): `z` follows
+the parameter's dtype, `p0`/`s` are bf16 either way, and only a bf16 store needs the dither - an fp32 parameter is
+written exactly.
 """
 
 import torch
@@ -75,17 +79,23 @@ def _stats_kernel(
     BLOCK_C: tl.constexpr,
     SLICE_P: tl.constexpr,
     DO_STATS: tl.constexpr,
+    PARAM_FP32: tl.constexpr,
 ):
     pid = tl.program_id(0)
     rows = tl.load(t_rows + pid)
     cols = tl.load(t_cols + pid)
-    grad = tl.load(t_grad + pid).to(tl.pointer_type(tl.bfloat16))
     pr = tl.load(t_pr + pid).to(tl.pointer_type(tl.float32))
     pc_partial = tl.load(t_pc_partial + pid).to(tl.pointer_type(tl.float32))
     beta2 = tl.load(scalars + _S_BETA2)
     value2 = tl.load(scalars + _S_VALUE2)
-    if DO_STATS:
+    # the gradient and `z` have the parameter's dtype, the subsamples are always bf16
+    if PARAM_FP32:
+        grad = tl.load(t_grad + pid).to(tl.pointer_type(tl.float32))
+        z = tl.load(t_z + pid).to(tl.pointer_type(tl.float32))
+    else:
+        grad = tl.load(t_grad + pid).to(tl.pointer_type(tl.bfloat16))
         z = tl.load(t_z + pid).to(tl.pointer_type(tl.bfloat16))
+    if DO_STATS:
         p0 = tl.load(t_p0 + pid).to(tl.pointer_type(tl.bfloat16))
         s = tl.load(t_s + pid).to(tl.pointer_type(tl.bfloat16))
         beta3 = tl.load(scalars + _S_BETA3)
@@ -117,9 +127,12 @@ def _stats_kernel(
                 sub = index // SLICE_P
                 p0_value = tl.load(p0 + sub, mask=selected, other=0.0)
                 z_value = tl.load(z + index, mask=selected, other=0.0)
-                # both are bf16, and the reference `p0 - z` is therefore rounded to bf16 before the product; Triton
-                # would otherwise compute the subtraction in fp32 and keep the extra mantissa bits
-                x0_minus = (p0_value - z_value).to(tl.bfloat16).to(tl.float32)
+                # the reference `p0 - z` runs in the promoted dtype: bf16 for bf16 parameters (which rounds it), fp32
+                # for fp32 ones (where `p0` is the only bf16 operand). Triton would keep the extra mantissa bits.
+                x0_minus = p0_value - z_value
+                if not PARAM_FP32:
+                    x0_minus = x0_minus.to(tl.bfloat16)
+                x0_minus = x0_minus.to(tl.float32)
                 dot += tl.sum(tl.where(selected, x * x0_minus, 0.0))
 
                 s_old = tl.load(s + sub, mask=selected, other=0.0)
@@ -204,14 +217,20 @@ def _update_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
     STOCHASTIC: tl.constexpr,
+    PARAM_FP32: tl.constexpr,
 ):
     pid = tl.program_id(0)
     rows = tl.load(t_rows + pid)
     cols = tl.load(t_cols + pid)
     flip = tl.load(t_flip + pid)
-    param = tl.load(t_param + pid).to(tl.pointer_type(tl.bfloat16))
-    grad = tl.load(t_grad + pid).to(tl.pointer_type(tl.bfloat16))
-    z = tl.load(t_z + pid).to(tl.pointer_type(tl.bfloat16))
+    if PARAM_FP32:
+        param = tl.load(t_param + pid).to(tl.pointer_type(tl.float32))
+        grad = tl.load(t_grad + pid).to(tl.pointer_type(tl.float32))
+        z = tl.load(t_z + pid).to(tl.pointer_type(tl.float32))
+    else:
+        param = tl.load(t_param + pid).to(tl.pointer_type(tl.bfloat16))
+        grad = tl.load(t_grad + pid).to(tl.pointer_type(tl.bfloat16))
+        z = tl.load(t_z + pid).to(tl.pointer_type(tl.bfloat16))
     pc = tl.load(t_pc + pid).to(tl.pointer_type(tl.float32))
     pr = tl.load(t_pr + pid).to(tl.pointer_type(tl.float32))
     dlr = tl.load(scalars + _S_DLR)
@@ -256,8 +275,9 @@ def _update_kernel(
                 z_bits = z_new.to(tl.int32, bitcast=True) + (noise_z.to(tl.int32) & 0xFFFF)
                 y_new = (y_bits & -65536).to(tl.float32, bitcast=True)
                 z_new = (z_bits & -65536).to(tl.float32, bitcast=True)
-            tl.store(param + index, y_new.to(tl.bfloat16), mask=mask)
-            tl.store(z + index, z_new.to(tl.bfloat16), mask=mask)
+            # the stores take the buffer's own dtype: bf16 after the dither (already representable), fp32 unchanged
+            tl.store(param + index, y_new.to(param.dtype.element_ty), mask=mask)
+            tl.store(z + index, z_new.to(z.dtype.element_ty), mask=mask)
 
 
 class KernelState:
@@ -328,7 +348,8 @@ class KernelState:
             row, col = state["exp_avg_sq_row"], state["exp_avg_sq_col"]
             pc, pr = (col, row) if flip else (row, col)
             for name, tensor, dtype in (
-                ("z", state["z"], torch.bfloat16),
+                # `z` follows the parameter, the subsamples and the second moment do not
+                ("z", state["z"], p.dtype),
                 ("p0", state.get("p0"), torch.bfloat16),
                 ("s", state.get("s"), torch.bfloat16),
                 ("exp_avg_sq_row", row, torch.float32),
@@ -375,15 +396,16 @@ def megakernel_supported(group) -> bool:
         and not (group["use_orthograd"] or group["use_speed"] or group["fused_back_pass"])
     ):
         return False
-    if not params or params[0].device.type != "cuda" or params[0].dtype != torch.bfloat16:
+    if not params or params[0].device.type != "cuda" or params[0].dtype not in (torch.bfloat16, torch.float32):
         return False
+    dtype = params[0].dtype
     return all(
         len(p.shape) == 2
-        and p.dtype == torch.bfloat16
+        and p.dtype == dtype
         and p.is_contiguous()
         and p.device == params[0].device
         and p.grad is not None
-        and p.grad.dtype == p.dtype
+        and p.grad.dtype == dtype
         and p.grad.shape == p.shape
         and p.grad.is_contiguous()
         for p in params
@@ -441,7 +463,9 @@ def step_megakernel(optimizer, group) -> bool:
     tables = state.tables(optimizer, params)
     if tables is None:
         return False
-    stochastic = group["stochastic_rounding"]
+    # the dither is what makes a bf16 store unbiased; an fp32 parameter is written exactly
+    param_fp32 = params[0].dtype == torch.float32
+    stochastic = group["stochastic_rounding"] and not param_fp32
     seed = torch.cuda.initial_seed()
 
     _stats_kernel[(n_params,)](
@@ -460,6 +484,7 @@ def step_megakernel(optimizer, group) -> bool:
         BLOCK_C=BLOCK_C,
         SLICE_P=_SLICE_P,
         DO_STATS=do_stats,
+        PARAM_FP32=param_fp32,
         num_warps=4,
     )
     _finalize_kernel[(n_params + 1,)](
@@ -493,6 +518,7 @@ def step_megakernel(optimizer, group) -> bool:
         BLOCK_R=BLOCK_R,
         BLOCK_C=BLOCK_C,
         STOCHASTIC=stochastic,
+        PARAM_FP32=param_fp32,
         num_warps=4,
     )
     if stochastic:

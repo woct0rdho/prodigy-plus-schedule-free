@@ -119,9 +119,14 @@ about 1 s on the first step, then nothing.
 
 Notes:
 * Option coverage is deliberately narrow: the schedule-free step with `eps=None` (Adam-atan2), `factored=True`,
-  `factored_fp32=True`, `weight_decay_by_lr` and no bias correction, on 2-D bf16 parameters. Anything else - and
-  `fused_back_pass`, `use_focus`, `use_cautious`, `use_grams`, `use_adopt`, `use_orthograd`, `use_speed`, a 1-D parameter
-  or a step where some parameter has no gradient - keeps the per-parameter loop. `use_megakernel=False` forces the loop.
+  `factored_fp32=True`, `weight_decay_by_lr` and no bias correction, on 2-D parameters that are contiguous, have a
+  gradient, and are bf16 or fp32. Anything else - and `fused_back_pass`, `use_focus`, `use_cautious`, `use_grams`,
+  `use_adopt`, `use_orthograd`, `use_speed`, a 1-D parameter or a step where some parameter has no gradient - keeps the
+  per-parameter loop. `use_megakernel=False` forces the loop.
+* Both parameter dtypes occur in practice: `mixed_precision='bf16'` alone keeps the network in fp32 (bf16 is autocast
+  only), and `--full_bf16` casts it to bf16. `z` follows the parameter's dtype, `p0`/`s` are bf16 either way, and only a
+  bf16 store needs the stochastic rounding - an fp32 parameter is written exactly. On the LoRA above: 351 ms -> 13 ms for
+  bf16 parameters, 306 ms -> 10 ms for fp32 ones.
 * The dither is Triton's Philox: the seed carries the step, the offset separates the parameters and the elements, and two
   of the four streams of one call cover the parameter and `z`. It is not PyTorch's stream and does not need to be -
   stochastic rounding only needs an unbiased dither, which the low 16 mantissa bits give (it rounds up with probability
